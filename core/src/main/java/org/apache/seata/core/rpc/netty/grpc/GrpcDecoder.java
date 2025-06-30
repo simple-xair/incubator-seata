@@ -17,6 +17,7 @@
 package org.apache.seata.core.rpc.netty.grpc;
 
 import io.netty.buffer.ByteBuf;
+import io.netty.buffer.Unpooled;
 import io.netty.channel.ChannelDuplexHandler;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.handler.codec.http2.Http2DataFrame;
@@ -38,6 +39,8 @@ import java.util.Map;
 
 public class GrpcDecoder extends ChannelDuplexHandler {
 
+    private final ByteBuf cumulation = Unpooled.buffer();
+
     @Override
     public void channelRead(ChannelHandlerContext ctx, Object msg) throws Exception {
         if (msg instanceof Http2HeadersFrame) {
@@ -52,22 +55,22 @@ public class GrpcDecoder extends ChannelDuplexHandler {
     public void onDataRead(ChannelHandlerContext ctx, Http2DataFrame msg) throws Exception {
         ByteBuf content = msg.content();
         try {
-            int readableBytes = content.readableBytes();
-            byte[] bytes = new byte[readableBytes];
-            content.readBytes(bytes);
-            if (bytes.length < 5) {
-                return;
-            }
+            cumulation.writeBytes(content);
 
-            int srcPos = 0;
-            while (srcPos < readableBytes) {
+            while (cumulation.readableBytes()>=5) {
                 // The first byte defaults to 0, indicating that no decompression is required
                 // Read the value of the next four bytes as the length of the body
-                int length = ((bytes[srcPos + 1] & 0xFF) << 24) | ((bytes[srcPos + 2] & 0xFF) << 16)
-                        | ((bytes[srcPos + 3] & 0xFF) << 8) | (bytes[srcPos + 4] & 0xFF);
+                byte compressFlag = cumulation.readByte();
+                int length = cumulation.readInt();
+
+                if (cumulation.readableBytes() < length) {
+                    cumulation.resetReaderIndex(); // Incomplete Frame
+                    return;
+                }
 
                 byte[] data = new byte[length];
-                System.arraycopy(bytes, srcPos + 5, data, 0, length);
+                cumulation.readBytes(data);
+
                 GrpcMessageProto grpcMessageProto = GrpcMessageProto.parseFrom(data);
                 byte[] bodyBytes = grpcMessageProto.getBody().toByteArray();
                 int messageType = grpcMessageProto.getMessageType();
@@ -75,9 +78,7 @@ public class GrpcDecoder extends ChannelDuplexHandler {
                 Map<String, String> headMap = grpcMessageProto.getHeadMapMap();
 
                 RpcMessage rpcMsg = new RpcMessage();
-                if (messageType <= Byte.MAX_VALUE && messageType >= Byte.MIN_VALUE) {
-                    rpcMsg.setMessageType((byte) messageType);
-                }
+                rpcMsg.setMessageType((byte) messageType);
                 rpcMsg.setId(messageId);
                 rpcMsg.setHeadMap(grpcMessageProto.getHeadMapMap());
 
@@ -104,8 +105,6 @@ public class GrpcDecoder extends ChannelDuplexHandler {
                 }
 
                 ctx.fireChannelRead(rpcMsg);
-
-                srcPos += length + 5;
             }
         } finally {
             ReferenceCountUtil.release(content);
